@@ -1,8 +1,20 @@
 """
 sql_extractor.py
 ----------------
-Scans a folder for .sql files and extracts all table and column references
-into a single Excel (.xlsx) report.
+Scans a folder for .sql files and produces a column-level lineage Excel report.
+
+For each SELECT-list projection the script extracts:
+  - Database / Schema / Source Table  (fully resolved from qualified table names)
+  - View Name                         (from CREATE VIEW, or blank for plain SELECT)
+  - View Column Name                  (the output alias)
+  - Formula/Transformation Flag       (Yes/No)
+  - Formula                           (the SQL expression, if transformed)
+  - Source Column                     (the underlying column name)
+  - Join Ordinal Sequence             (1 = FROM table, 2 = first JOIN, …)
+  - Join Type                         (FROM / INNER JOIN / LEFT OUTER JOIN / …)
+
+CTE columns are traced back to their ultimate physical source table(s).
+Multi-source expressions (e.g. CONCAT(a, b)) produce one output row per source column.
 
 Usage:
     python sql_extractor.py <folder_path>
@@ -25,6 +37,30 @@ import sqlglot.expressions as exp
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# SQL data type keywords that may appear as Column nodes inside CAST/CONVERT
+# expressions — these should never be treated as real column references.
+_SQL_TYPE_KEYWORDS = {
+    "datetime", "datetime2", "date", "time", "smalldatetime",
+    "varchar", "nvarchar", "char", "nchar", "text", "ntext",
+    "int", "integer", "bigint", "smallint", "tinyint",
+    "float", "real", "decimal", "numeric", "money", "smallmoney",
+    "bit", "binary", "varbinary", "uniqueidentifier", "xml",
+    "image", "geography", "geometry",
+}
+
+OUTPUT_COLUMNS = [
+    "Database",
+    "Schema",
+    "View Name",
+    "View Column Name",
+    "Formula/Transformation Flag",
+    "Formula",
+    "Source Table",
+    "Source Column",
+    "Join Ordinal Sequence",
+    "Join Type",
+]
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -32,126 +68,352 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract all table and column references from .sql files in a folder."
+        description="Extract column lineage from .sql files into an Excel report."
     )
-    parser.add_argument(
-        "folder",
-        nargs="?",
-        default=None,
-        help="Path to folder containing .sql files (positional)",
-    )
-    parser.add_argument(
-        "--folder",
-        dest="folder_flag",
-        default=None,
-        help="Path to folder containing .sql files (named flag)",
-    )
+    parser.add_argument("folder", nargs="?", default=None,
+                        help="Path to folder containing .sql files (positional)")
+    parser.add_argument("--folder", dest="folder_flag", default=None,
+                        help="Path to folder containing .sql files (named flag)")
     return parser.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Extraction helpers
+# View name
 # ---------------------------------------------------------------------------
 
-def _make_row(col: exp.Column, clause: str, filename: str) -> dict:
-    """Build one output row from a Column AST node."""
+def get_view_name(statement: exp.Expression) -> str | None:
+    """Return the view/object name from CREATE VIEW, or None for plain SELECT."""
+    if isinstance(statement, exp.Create):
+        table = statement.find(exp.Table)
+        if table:
+            return table.name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Table registry  (alias → metadata)
+# ---------------------------------------------------------------------------
+
+def _make_table_info(table_node: exp.Table, ordinal: int, join_type: str) -> dict:
+    name = table_node.name
+    schema = table_node.db or None        # sqlglot: db = schema
+    database = table_node.catalog or None  # sqlglot: catalog = database
+    source_table = f"{schema}.{name}" if schema else name
     return {
-        "file": filename,
-        "table_name": col.table or None,   # qualifier alias (e.g. "c" in c.customer_id)
-        "column_name": col.name,            # just the column identifier
-        "clause": clause,
+        "database": database,
+        "schema": schema,
+        "table": name,
+        "source_table": source_table,
+        "ordinal": ordinal,
+        "join_type": join_type,
     }
 
 
-def _extract_columns_from_select(select_node: exp.Select, filename: str) -> list[dict]:
+def _get_join_type(join_node: exp.Join) -> str:
+    parts = []
+    side = join_node.args.get("side") or ""
+    kind = join_node.args.get("kind") or ""
+    if side:
+        parts.append(str(side).upper())
+    if kind:
+        parts.append(str(kind).upper())
+    parts.append("JOIN")
+    return " ".join(parts)
+
+
+def _table_from_clause_expr(expr: exp.Expression) -> exp.Table | None:
+    """Extract the exp.Table from a FROM/JOIN expression, skipping subqueries."""
+    if isinstance(expr, exp.Table):
+        return expr
+    if isinstance(expr, exp.Alias) and isinstance(expr.this, exp.Table):
+        return expr.this
+    return None
+
+
+def build_table_registry(select_node: exp.Select) -> dict:
     """
-    Extract all column references from a single SELECT node by inspecting
-    each clause in isolation (clause-first approach).
-    This avoids ambiguity when the same column name appears in multiple clauses.
+    Build {alias_or_name: table_info} for the direct FROM + JOIN tables
+    of a single SELECT node (does not descend into subqueries).
+    Note: sqlglot v25+ stores FROM as args["from_"] (with underscore).
     """
-    rows: list[dict] = []
+    registry: dict = {}
+    ordinal = 0
 
-    # --- SELECT list (projection) ---
-    for projection in select_node.expressions:
-        if isinstance(projection, exp.Star):
-            rows.append({"file": filename, "table_name": None, "column_name": "*", "clause": "SELECT"})
-        elif isinstance(projection, exp.Dot) and isinstance(projection.expression, exp.Star):
-            # table.* form
-            table_alias = projection.this.name if hasattr(projection.this, "name") else None
-            rows.append({"file": filename, "table_name": table_alias, "column_name": "*", "clause": "SELECT"})
-        else:
-            for col in projection.find_all(exp.Column):
-                rows.append(_make_row(col, "SELECT", filename))
+    # sqlglot >= 25 uses "from_" as the key; fall back to "from" for safety
+    from_clause = select_node.args.get("from_") or select_node.args.get("from")
+    if from_clause:
+        table = _table_from_clause_expr(from_clause.this) if from_clause.this else None
+        if table:
+            ordinal += 1
+            key = table.alias or table.name
+            registry[key] = _make_table_info(table, ordinal, "FROM")
 
-    # --- WHERE ---
-    where = select_node.args.get("where")
-    if where:
-        for col in where.find_all(exp.Column):
-            rows.append(_make_row(col, "WHERE", filename))
-
-    # --- JOINs (ON conditions) ---
     for join in select_node.args.get("joins") or []:
-        on_clause = join.args.get("on")
-        if on_clause:
-            for col in on_clause.find_all(exp.Column):
-                rows.append(_make_row(col, "JOIN ON", filename))
+        table = _table_from_clause_expr(join.this) if join.this else None
+        if table:
+            ordinal += 1
+            key = table.alias or table.name
+            registry[key] = _make_table_info(table, ordinal, _get_join_type(join))
 
-    # --- GROUP BY ---
-    group = select_node.args.get("group")
-    if group:
-        for col in group.find_all(exp.Column):
-            rows.append(_make_row(col, "GROUP BY", filename))
+    return registry
 
-    # --- HAVING ---
-    having = select_node.args.get("having")
-    if having:
-        for col in having.find_all(exp.Column):
-            rows.append(_make_row(col, "HAVING", filename))
 
-    # --- ORDER BY ---
-    order = select_node.args.get("order")
-    if order:
-        for col in order.find_all(exp.Column):
-            rows.append(_make_row(col, "ORDER BY", filename))
+# ---------------------------------------------------------------------------
+# CTE registry
+# ---------------------------------------------------------------------------
+
+def build_cte_registry(statement: exp.Expression) -> dict:
+    """
+    Build {cte_name: {select: exp.Select, table_registry: dict}}
+    for all CTEs defined in the statement.
+    """
+    cte_registry: dict = {}
+    # sqlglot >= 25 uses "with_" as the key; fall back to "with" for safety
+    with_node = statement.args.get("with_") or statement.args.get("with")
+    if not with_node:
+        return cte_registry
+
+    for cte in (with_node.expressions or []):
+        cte_name = cte.alias
+        body = cte.this
+        # Unwrap Subquery wrapper if present
+        if isinstance(body, exp.Subquery):
+            body = body.this
+        if isinstance(body, (exp.Select, exp.Union)):
+            # For UNION inside a CTE, take first branch for projection lookup
+            sel = body if isinstance(body, exp.Select) else _first_select(body)
+            if sel:
+                cte_registry[cte_name] = {
+                    "select": sel,
+                    "table_registry": build_table_registry(sel),
+                }
+    return cte_registry
+
+
+def _first_select(node: exp.Expression) -> exp.Select | None:
+    """Return the first exp.Select in a Union tree."""
+    if isinstance(node, exp.Select):
+        return node
+    if isinstance(node, exp.Union):
+        return _first_select(node.this)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# CTE-aware column resolution
+# ---------------------------------------------------------------------------
+
+def _lookup(registry: dict, key: str | None) -> dict | None:
+    """Case-insensitive dict lookup."""
+    if key is None:
+        return None
+    direct = registry.get(key)
+    if direct:
+        return direct
+    key_low = key.lower()
+    for k, v in registry.items():
+        if k.lower() == key_low:
+            return v
+    return None
+
+
+def resolve_to_physical(
+    col_name: str,
+    table_alias: str | None,
+    local_table_reg: dict,
+    cte_registry: dict,
+    depth: int = 0,
+) -> list[dict]:
+    """
+    Recursively trace a column reference through CTEs until a physical table
+    is reached.  Returns a list of resolved dicts (one per physical source).
+    """
+    if depth > 15:
+        return [_unresolved(table_alias, col_name)]
+
+    table_info = _lookup(local_table_reg, table_alias)
+    if table_info is None:
+        # No qualifier — try to find a single-table registry
+        if len(local_table_reg) == 1:
+            table_info = next(iter(local_table_reg.values()))
+        else:
+            return [_unresolved(table_alias, col_name)]
+
+    table_name = table_info["table"]
+    cte_info = _lookup(cte_registry, table_name)
+
+    if cte_info:
+        # This table reference is a CTE — look up the matching projection
+        cte_sel: exp.Select = cte_info["select"]
+        cte_table_reg: dict = cte_info["table_registry"]
+
+        for proj in cte_sel.expressions:
+            proj_alias: str | None = None
+            proj_expr = proj
+
+            if isinstance(proj, exp.Alias):
+                proj_alias = proj.alias
+                proj_expr = proj.this
+            elif isinstance(proj, exp.Column):
+                proj_alias = proj.name
+
+            if proj_alias and proj_alias.lower() == col_name.lower():
+                # Found the matching CTE output column — recurse into its expression
+                source_cols = (
+                    [proj_expr] if isinstance(proj_expr, exp.Column)
+                    else list(proj_expr.find_all(exp.Column))
+                )
+                results: list[dict] = []
+                for src_col in source_cols:
+                    results.extend(
+                        resolve_to_physical(
+                            src_col.name, src_col.table,
+                            cte_table_reg, cte_registry,
+                            depth + 1,
+                        )
+                    )
+                return results if results else [_unresolved(table_name, col_name)]
+
+        # Column not found by alias in CTE projections
+        return [_unresolved(table_name, col_name)]
+
+    # Physical table
+    return [{
+        "database": table_info["database"],
+        "schema": table_info["schema"],
+        "source_table": table_info["source_table"],
+        "source_column": col_name,
+        "ordinal": table_info["ordinal"],
+        "join_type": table_info["join_type"],
+    }]
+
+
+def _unresolved(table_alias: str | None, col_name: str) -> dict:
+    return {
+        "database": None,
+        "schema": None,
+        "source_table": table_alias or None,
+        "source_column": col_name,
+        "ordinal": None,
+        "join_type": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SELECT projection processing
+# ---------------------------------------------------------------------------
+
+def _make_row(view_name, view_col_name, is_transformed, formula, resolution) -> dict:
+    return {
+        "Database": resolution["database"],
+        "Schema": resolution["schema"],
+        "View Name": view_name,
+        "View Column Name": view_col_name,
+        "Formula/Transformation Flag": "Yes" if is_transformed else "No",
+        "Formula": formula if is_transformed else None,
+        "Source Table": resolution["source_table"],
+        "Source Column": resolution["source_column"],
+        "Join Ordinal Sequence": resolution["ordinal"],
+        "Join Type": resolution["join_type"],
+    }
+
+
+def process_select(
+    select_node: exp.Select,
+    view_name: str | None,
+    cte_registry: dict,
+) -> list[dict]:
+    """Process one SELECT node and return lineage rows for its projection list."""
+    rows: list[dict] = []
+    table_reg = build_table_registry(select_node)
+
+    for projection in select_node.expressions:
+        # --- Determine output alias and source expression ---
+        if isinstance(projection, exp.Alias):
+            view_col_name = projection.alias
+            expr = projection.this
+        elif isinstance(projection, exp.Column):
+            view_col_name = projection.name
+            expr = projection
+        elif isinstance(projection, exp.Star):
+            rows.append(_make_row(view_name, "*", False, None,
+                                  _unresolved(None, "*")))
+            continue
+        else:
+            # Unaliased expression (function, literal, etc.)
+            view_col_name = projection.sql(dialect="tsql")
+            expr = projection
+
+        # --- Plain column vs. transformed expression ---
+        if isinstance(expr, exp.Column):
+            is_transformed = False
+            formula = None
+            source_cols = [expr]
+        else:
+            is_transformed = True
+            formula = expr.sql(dialect="tsql")
+            # Filter out SQL data type keywords that sqlglot may surface as Column nodes
+            # inside CAST/CONVERT expressions (e.g. CONVERT(DATETIME, ...) → "DATETIME" col)
+            source_cols = [
+                c for c in expr.find_all(exp.Column)
+                if c.name.lower() not in _SQL_TYPE_KEYWORDS
+            ]
+
+        # --- No column references (GETDATE(), literal, etc.) ---
+        if not source_cols:
+            rows.append(_make_row(view_name, view_col_name, is_transformed, formula,
+                                  _unresolved(None, None)))
+            continue
+
+        # --- Resolve each source column through CTEs to physical table ---
+        for col in source_cols:
+            for res in resolve_to_physical(col.name, col.table or None,
+                                           table_reg, cte_registry):
+                rows.append(_make_row(view_name, view_col_name, is_transformed,
+                                      formula, res))
 
     return rows
 
 
-def _extract_tables(statement: exp.Expression) -> list[str]:
-    """Return all unique table names referenced in the statement."""
-    tables = []
-    seen: set[str] = set()
-    for table_node in statement.find_all(exp.Table):
-        name = table_node.name
-        if name and name not in seen:
-            seen.add(name)
-            tables.append(name)
-    return tables
+# ---------------------------------------------------------------------------
+# Statement-level extraction
+# ---------------------------------------------------------------------------
+
+def _iter_main_selects(query_body: exp.Expression):
+    """Yield all SELECT branches of the main query (handles UNION)."""
+    if isinstance(query_body, exp.Select):
+        yield query_body
+    elif isinstance(query_body, exp.Union):
+        yield from _iter_main_selects(query_body.this)
+        yield from _iter_main_selects(query_body.expression)
+    elif isinstance(query_body, exp.Subquery):
+        yield from _iter_main_selects(query_body.this)
+
+
+def _get_query_body(statement: exp.Expression) -> exp.Expression | None:
+    """Extract the main query body from a statement (handles CREATE VIEW)."""
+    if isinstance(statement, exp.Create):
+        # expression holds the SELECT/UNION after AS
+        body = statement.args.get("expression")
+        if body:
+            return body
+        # Fallback: first Select/Union in the tree (skip the table definition)
+        return statement.find(exp.Select)
+    if isinstance(statement, (exp.Select, exp.Union)):
+        return statement
+    return statement.find(exp.Select)
 
 
 def extract_from_statement(statement: exp.Expression, filename: str) -> list[dict]:
-    """
-    Walk all SELECT nodes in the AST (including CTEs and subqueries)
-    and collect column + table references.
-    """
+    view_name = get_view_name(statement)       # None → blank in output
+    cte_registry = build_cte_registry(statement)
+    query_body = _get_query_body(statement)
+    if query_body is None:
+        return []
+
     rows: list[dict] = []
-
-    # Collect columns from every SELECT node in the tree
-    for select_node in statement.find_all(exp.Select):
-        rows.extend(_extract_columns_from_select(select_node, filename))
-
-    # Collect all table names and add a deduplicated "table reference" row
-    # for tables that have no columns listed against them (e.g. in FROM only).
-    # These are tracked separately and merged into the output to avoid losing
-    # table-only references.
-    for table_name in _extract_tables(statement):
-        rows.append({
-            "file": filename,
-            "table_name": table_name,
-            "column_name": None,
-            "clause": "FROM/JOIN (table)",
-        })
-
+    for select_node in _iter_main_selects(query_body):
+        rows.extend(process_select(select_node, view_name, cte_registry))
     return rows
 
 
@@ -160,10 +422,6 @@ def extract_from_statement(statement: exp.Expression, filename: str) -> list[dic
 # ---------------------------------------------------------------------------
 
 def process_file(filepath: Path) -> tuple[list[dict], int, int]:
-    """
-    Parse one SQL file and return (rows, success_count, skip_count).
-    Never raises; logs warnings on parse errors.
-    """
     filename = filepath.name
     try:
         sql_text = filepath.read_text(encoding="utf-8", errors="replace")
@@ -171,10 +429,16 @@ def process_file(filepath: Path) -> tuple[list[dict], int, int]:
         logger.warning(f"Could not read {filename}: {e}")
         return [], 0, 1
 
-    try:
-        statements = sqlglot.parse(sql_text)   # list; handles multi-statement files
-    except Exception as e:
-        logger.warning(f"Could not parse {filename}: {e}")
+    # Try generic dialect first, then T-SQL (handles CONVERT(type, expr, style))
+    statements = None
+    for dialect in (None, "tsql"):
+        try:
+            statements = sqlglot.parse(sql_text, dialect=dialect)
+            break
+        except Exception:
+            pass
+    if statements is None:
+        logger.warning(f"Could not parse {filename} in any supported dialect — skipping.")
         return [], 0, 1
 
     rows: list[dict] = []
@@ -191,30 +455,25 @@ def process_file(filepath: Path) -> tuple[list[dict], int, int]:
 # ---------------------------------------------------------------------------
 
 def write_output(rows: list[dict], folder_path: Path) -> Path:
-    """Write deduplicated results to an Excel file inside the input folder."""
     folder_name = folder_path.resolve().name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_name = f"{folder_name}_columns_{timestamp}.xlsx"
-    output_path = folder_path.resolve() / output_name
+    output_path = folder_path.resolve() / f"{folder_name}_columns_{timestamp}.xlsx"
 
-    df = pd.DataFrame(rows, columns=["file", "table_name", "column_name", "clause"])
+    df = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
     df = df.drop_duplicates()
     df = df.sort_values(
-        ["file", "clause", "table_name", "column_name"],
+        ["View Name", "Join Ordinal Sequence", "View Column Name"],
         na_position="last",
     ).reset_index(drop=True)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="SQL Columns")
-
-        # Auto-fit column widths
-        ws = writer.sheets["SQL Columns"]
+        df.to_excel(writer, index=False, sheet_name="Column Lineage")
+        ws = writer.sheets["Column Lineage"]
         for col_cells in ws.columns:
             max_len = max(
-                (len(str(cell.value)) if cell.value is not None else 0)
-                for cell in col_cells
+                (len(str(c.value)) if c.value is not None else 0) for c in col_cells
             )
-            ws.column_dimensions[col_cells[0].column_letter].width = max_len + 4
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 80)
 
     return output_path
 
@@ -257,7 +516,7 @@ def main() -> None:
         total_success += success
         total_skip += skip
         if success:
-            logger.info(f"  Parsed: {sql_file.name}  ({len(rows)} references)")
+            logger.info(f"  Parsed: {sql_file.name}  ({len(rows)} lineage rows)")
 
     logger.info(
         f"Done — processed {total_success} file(s), "
@@ -265,7 +524,7 @@ def main() -> None:
     )
 
     if not all_rows:
-        logger.warning("No references found. No output file written.")
+        logger.warning("No lineage data found. No output file written.")
         sys.exit(0)
 
     output_path = write_output(all_rows, folder_path)
