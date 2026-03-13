@@ -44,3 +44,9 @@ exports/
 # Logs
 *.log
 logs/
+
+# Test data (local only)
+tests/
+
+# Claude project files
+.claude/
