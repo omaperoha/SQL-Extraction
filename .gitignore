@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log
+.npm
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Credentials / Secrets
+*.key
+*.pem
+secrets.json
+credentials.json
+service_account.json
+
+# Outputs
+output/
+exports/
+*.csv
+*.xlsx
+*.parquet
+
+# Logs
+*.log
+logs/
