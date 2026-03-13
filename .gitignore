@@ -40,13 +40,15 @@ exports/
 *.csv
 *.xlsx
 *.parquet
+# Allow the sample output file in tests
+!tests/sql_samples/sql_samples_columns_*.xlsx
 
 # Logs
 *.log
 logs/
 
-# Test data (local only)
-tests/
+# Test SQL files (local only — keep sample output xlsx)
+tests/**/*.sql
 
 # Claude project files
 .claude/
