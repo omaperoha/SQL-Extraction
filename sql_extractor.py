@@ -59,6 +59,8 @@ OUTPUT_COLUMNS = [
     "Source Column",
     "Join Ordinal Sequence",
     "Join Type",
+    "Join Flag",
+    "Join Condition",
 ]
 
 
@@ -303,7 +305,32 @@ def _unresolved(table_alias: str | None, col_name: str) -> dict:
 # SELECT projection processing
 # ---------------------------------------------------------------------------
 
-def _make_row(view_name, view_col_name, is_transformed, formula, resolution) -> dict:
+def _build_join_condition_map(select_node: exp.Select) -> dict:
+    """
+    Scan all JOIN ON clauses in a SELECT and return a dict that maps each
+    column reference to the ON condition text it appears in.
+
+    Returns {(table_alias_lower, col_name_lower): on_clause_sql, …}
+    A column that appears in multiple ON clauses gets its conditions
+    joined with ' ; '.
+    """
+    jc_map: dict[tuple[str, str], str] = {}
+    for join in select_node.args.get("joins") or []:
+        on_clause = join.args.get("on")
+        if not on_clause:
+            continue
+        on_text = on_clause.sql(dialect="tsql")
+        for col in on_clause.find_all(exp.Column):
+            key = ((col.table or "").lower(), col.name.lower())
+            if key in jc_map:
+                jc_map[key] = jc_map[key] + " ; " + on_text
+            else:
+                jc_map[key] = on_text
+    return jc_map
+
+
+def _make_row(view_name, view_col_name, is_transformed, formula, resolution,
+              join_flag=False, join_condition=None) -> dict:
     return {
         "Database": resolution["database"],
         "Schema": resolution["schema"],
@@ -315,6 +342,8 @@ def _make_row(view_name, view_col_name, is_transformed, formula, resolution) -> 
         "Source Column": resolution["source_column"],
         "Join Ordinal Sequence": resolution["ordinal"],
         "Join Type": resolution["join_type"],
+        "Join Flag": join_flag,
+        "Join Condition": join_condition,
     }
 
 
@@ -326,6 +355,7 @@ def process_select(
     """Process one SELECT node and return lineage rows for its projection list."""
     rows: list[dict] = []
     table_reg = build_table_registry(select_node)
+    jc_map = _build_join_condition_map(select_node)
 
     for projection in select_node.expressions:
         # --- Determine output alias and source expression ---
@@ -367,10 +397,17 @@ def process_select(
 
         # --- Resolve each source column through CTEs to physical table ---
         for col in source_cols:
+            # Check if this column reference appears in any JOIN ON condition
+            jc_key = ((col.table or "").lower(), col.name.lower())
+            join_condition = jc_map.get(jc_key)
+            join_flag = join_condition is not None
+
             for res in resolve_to_physical(col.name, col.table or None,
                                            table_reg, cte_registry):
                 rows.append(_make_row(view_name, view_col_name, is_transformed,
-                                      formula, res))
+                                      formula, res,
+                                      join_flag=join_flag,
+                                      join_condition=join_condition))
 
     return rows
 
