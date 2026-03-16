@@ -418,20 +418,69 @@ def extract_from_statement(statement: exp.Expression, filename: str) -> list[dic
 
 
 # ---------------------------------------------------------------------------
+# File preprocessing (encoding + T-SQL preamble removal)
+# ---------------------------------------------------------------------------
+
+# Lines whose uppercased text starts with any of these are stripped before parsing.
+_TSQL_PREAMBLE_PREFIXES = ("SET ANSI_NULLS", "SET QUOTED_IDENTIFIER", "USE ")
+
+def _preprocess_sql(raw_bytes: bytes) -> tuple[str, str | None]:
+    """
+    Decode a raw SQL file (handles UTF-16 SSMS exports),
+    strip T-SQL batch separators (GO) and SET/USE preambles.
+
+    Returns (cleaned_sql, default_database).
+    default_database is extracted from USE [db] before removal.
+    """
+    import re
+
+    # Detect BOM and decode accordingly
+    if raw_bytes.startswith(b"\xff\xfe") or raw_bytes.startswith(b"\xfe\xff"):
+        text = raw_bytes.decode("utf-16")
+    elif raw_bytes.startswith(b"\xef\xbb\xbf"):
+        text = raw_bytes.decode("utf-8-sig")
+    else:
+        text = raw_bytes.decode("utf-8", errors="replace")
+
+    default_database: str | None = None
+    cleaned: list[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        upper = stripped.upper()
+        # Remove standalone GO batch separators
+        if upper == "GO":
+            continue
+        # Capture database name from USE [db] before removing
+        if upper.startswith("USE "):
+            m = re.match(r"USE\s+\[?(\w+)\]?", stripped, re.IGNORECASE)
+            if m:
+                default_database = m.group(1)
+            continue
+        # Remove SET ANSI_NULLS, SET QUOTED_IDENTIFIER
+        if upper.startswith("SET ANSI_NULLS") or upper.startswith("SET QUOTED_IDENTIFIER"):
+            continue
+        cleaned.append(line)
+
+    return "\n".join(cleaned), default_database
+
+
+# ---------------------------------------------------------------------------
 # File processing
 # ---------------------------------------------------------------------------
 
 def process_file(filepath: Path) -> tuple[list[dict], int, int]:
     filename = filepath.name
     try:
-        sql_text = filepath.read_text(encoding="utf-8", errors="replace")
+        raw_bytes = filepath.read_bytes()
+        sql_text, default_database = _preprocess_sql(raw_bytes)
     except OSError as e:
         logger.warning(f"Could not read {filename}: {e}")
         return [], 0, 1
 
-    # Try generic dialect first, then T-SQL (handles CONVERT(type, expr, style))
+    # Try T-SQL dialect first (most SSMS exports), then generic fallback
     statements = None
-    for dialect in (None, "tsql"):
+    for dialect in ("tsql", None):
         try:
             statements = sqlglot.parse(sql_text, dialect=dialect)
             break
@@ -446,6 +495,12 @@ def process_file(filepath: Path) -> tuple[list[dict], int, int]:
         if stmt is None:
             continue
         rows.extend(extract_from_statement(stmt, filename))
+
+    # Apply default database (from USE [db]) to rows that have no Database value
+    if default_database:
+        for row in rows:
+            if row.get("Database") is None:
+                row["Database"] = default_database
 
     return rows, 1, 0
 
