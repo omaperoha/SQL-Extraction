@@ -305,10 +305,32 @@ def _unresolved(table_alias: str | None, col_name: str) -> dict:
 # SELECT projection processing
 # ---------------------------------------------------------------------------
 
-def _build_join_condition_map(select_node: exp.Select) -> dict:
+def _expand_aliases_in_text(text: str, table_reg: dict) -> str:
+    """Replace table aliases with full table names in SQL text (e.g. F. → FactClaims_MAIN.)."""
+    import re
+    # Sort aliases longest-first to avoid partial replacements
+    for alias, info in sorted(table_reg.items(), key=lambda x: -len(x[0])):
+        full = info["source_table"]
+        # Unbracketed:  F.col  →  FactClaims_MAIN.col
+        text = re.sub(
+            r'\b' + re.escape(alias) + r'(?=\s*\.)',
+            full, text, flags=re.IGNORECASE,
+        )
+        # Bracketed:  [F].[col]  →  FactClaims_MAIN.[col]
+        text = re.sub(
+            r'\[' + re.escape(alias) + r'\](?=\s*\.)',
+            full, text, flags=re.IGNORECASE,
+        )
+    return text
+
+
+def _build_join_condition_map(select_node: exp.Select, table_reg: dict) -> dict:
     """
     Scan all JOIN ON clauses in a SELECT and return a dict that maps each
     column reference to the ON condition text it appears in.
+
+    Table aliases in the condition text are expanded to full table names
+    using the table registry (e.g. F.col → FactClaims_MAIN.col).
 
     Returns {(table_alias_lower, col_name_lower): on_clause_sql, …}
     A column that appears in multiple ON clauses gets its conditions
@@ -319,7 +341,7 @@ def _build_join_condition_map(select_node: exp.Select) -> dict:
         on_clause = join.args.get("on")
         if not on_clause:
             continue
-        on_text = on_clause.sql(dialect="tsql")
+        on_text = _expand_aliases_in_text(on_clause.sql(dialect="tsql"), table_reg)
         for col in on_clause.find_all(exp.Column):
             key = ((col.table or "").lower(), col.name.lower())
             if key in jc_map:
@@ -355,7 +377,7 @@ def process_select(
     """Process one SELECT node and return lineage rows for its projection list."""
     rows: list[dict] = []
     table_reg = build_table_registry(select_node)
-    jc_map = _build_join_condition_map(select_node)
+    jc_map = _build_join_condition_map(select_node, table_reg)
 
     for projection in select_node.expressions:
         # --- Determine output alias and source expression ---
